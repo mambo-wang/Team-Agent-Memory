@@ -57,71 +57,144 @@ L3 Core/Persona  →  核心记忆（长期画像、稳定模式）
 
 ---
 
-## 二、部署流程
+## 二、从 0 到 1 安装部署（把官方git地址发给AI助手即可）
 
-### 2.1 环境要求
+> 目标：在一台干净主机上从零装好三件套（memory-core + memory-hub + proxy），并让 coding agent 接入记忆。整个流程只需要 Docker + 两个 LLM API Key，无需本地 Node 环境。
 
-- Docker + Docker Compose
-- 一个可用的 LLM API（OpenAI 兼容协议）
-- 端口：8420、8125、8424、8096
+### 2.1 组件与镜像总览
 
-### 2.2 一键部署（完整三件套）
+一键部署会拉起三个容器，镜像来自 Docker Hub 的 `agentmemory/` 组织（多架构 amd64 + arm64，`docker pull` 无需登录）：
+
+| 组件 | 镜像 | 容器名 | 端口 | 职责 |
+|------|------|--------|------|------|
+| Memory Core | `agentmemory/memory-core:latest` | `tdai-memory-core` | 8420 | 记忆读写、L0-L3 Pipeline、鉴权 |
+| Memory Hub | `agentmemory/memory-hub:latest` | `tdai-memory-hub` | 8125 / 8424 | Panel 管理面板 + Knowledge 服务 |
+| Proxy | `agentmemory/memory-proxy:latest` | `tdai-proxy` | 8096 | 代理上游 LLM，注入 skill / 记忆 |
+
+三个容器在同一个 docker 网络 `tdai-memory-stack` 内互通（网络别名 `memory-core` / `memory-hub` / `proxy`）。
+
+**手动拉取（可选，`start-all.sh` 会自动拉）**：
+
+```bash
+docker pull agentmemory/memory-core:latest
+docker pull agentmemory/memory-hub:latest
+docker pull agentmemory/memory-proxy:latest
+```
+
+> 想固定版本把 `:latest` 换成具体 tag（如 `:1.0.0-beta.1`）。本地已有同名 `:latest` 时脚本会直接复用、不会感知远端更新，需 `PULL=1 ./start-all.sh` 强制拉新。
+> 腾讯内网备选：把三个 IMAGE 变量覆盖为 `mirrors.tencent.com/memory-team-control/...` 私仓（需先 `docker login`）。
+
+### 2.2 环境要求
+
+- Linux / macOS / Windows(WSL2) + Docker（`start-*.sh` 是 bash 脚本，需 bash）
+- 两组可用的 OpenAI 兼容 LLM API（memory 组与 proxy 组可以相同，也可以不同供应商）
+- 放行端口：8420（core）、8125（panel）、8424（knowledge）、8096（proxy）
+
+### 2.3 第一步：获取代码
 
 ```bash
 git clone https://github.com/TencentCloud/TencentDB-Agent-Memory.git
 cd TencentDB-Agent-Memory/deploy/global-images
-cp .env.example .env
-$EDITOR .env       # 填入 LLM 参数
-./start-all.sh     # 一键启动
+ls
+# 应看到 .env.example 与 start-all.sh / start-memory-core.sh /
+#   start-memory-hub.sh / start-proxy.sh / stop-all.sh / _lib.sh
 ```
 
-### 2.3 .env 关键配置
+### 2.4 第二步：配置 .env（关键步骤）
 
 ```bash
-# ── Memory Core / Hub 内部 LLM ──
+cp .env.example .env
+vim .env   # 或任意编辑器
+```
+
+**必填项**（不填或仍为 `REPLACE_ME` 时 `start-all.sh` 会直接报错拒绝启动，见 2.8 报错速查）：
+
+```bash
+# ── memory 组：memory-core 提取/总结 + memory-hub 知识 ingest 用的 LLM ──
 MEMORY_LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 MEMORY_LLM_API_KEY=sk-xxx
 MEMORY_LLM_MODEL=qwen3.8-max
 
-# ── Proxy 上游 LLM ──
-PROXY_UPSTREAM_URL=https://api.anthropic.com
-PROXY_UPSTREAM_API_KEY=sk-ant-xxx
-PROXY_UPSTREAM_MODEL=claude-sonnet-4-20250514
+# ── proxy 组：coding agent 请求经 proxy 转发到的上游 LLM ──
+PROXY_UPSTREAM_URL=https://api.deepseek.com/v1
+PROXY_UPSTREAM_API_KEY=sk-xxx
+PROXY_UPSTREAM_MODEL=deepseek-v4-flash
+```
 
-# ── Embedding（可选，默认关闭）──
+**可选配置**：
+
+```bash
+# 开启向量检索（不开则走 BM25 关键词；聊天模型不能当 embedding 用，必须用专门 embedding 模型）
 MEMORY_EMBEDDING_PROVIDER=openai
 MEMORY_EMBEDDING_MODEL=qwen3.7-text-embedding
 MEMORY_EMBEDDING_DIMENSIONS=1024
+
+# 一键打开完整注入链路：auth + sessionInit（弹表单）+ tdai 记忆注入
+PROXY_FULL_STACK=1
+
+# 端口被占用时改这里
+MEMORY_CORE_PORT=8420
+PANEL_PORT=8125
+KNOWLEDGE_PORT=8424
+PROXY_PORT=8096
 ```
 
-### 2.4 单独部署 Memory Core
+> ⚠️ `MEMORY_CORE_GATEWAY_API_KEY` **保持留空**。设非空会导致 proxy 的 auth/sessionInit 因不带 Bearer header 而失败（见 start-memory-core.sh 顶部注释）。
 
-如果只需要记忆服务（不需要 Hub/Proxy），可以单独启动：
+### 2.5 第三步：一键启动
+
+```bash
+PULL=1 ./start-all.sh   # PULL=1 强制拉最新镜像；不加则本地已有就复用
+```
+
+脚本按 `memory-core → memory-hub → proxy` 顺序启动，每个都等容器 healthy 才继续；任一步失败会中止并打印容器日志。
+
+**启动成功后自动完成的事**：
+
+1. 生成 memory-core 配置 `deploy/global-images/.memory-core-config/tdai-gateway.yaml`（由 `.env` 的 `MEMORY_LLM_*` 渲染）
+2. 生成 proxy 配置 `deploy/global-images/.proxy-config/config.yaml`（由 `PROXY_UPSTREAM_*` + 三大开关渲染）
+3. memory-core 首次启动自动 `init-admin`，生成一把随机 `sk-mem-...` 写到 `deploy/global-images/.admin-key`
+4. 打印全部服务地址与 Claude Code 接入命令
+
+> 两个 yaml 都是脚本**每次启动重新生成**，手动改不生效（见 7.1）。要改配置就改 `.env` 后重启。
+
+### 2.6 第四步：验证部署
+
+```bash
+# 1. 三个容器都在运行且 healthy
+docker ps --format '{{.Names}}\t{{.Status}}'
+
+# 2. Memory Core 健康检查（stores 里的 embeddingService/strategy 取决于是否开 embedding）
+curl -s http://localhost:8420/health | jq '{status, stores, services}'
+
+# 3. Panel 与 Knowledge 健康检查
+curl -s http://localhost:8125/health | jq .status
+curl -s http://localhost:8424/health | jq .status
+
+# 4. 拿到 admin user_key（后续客户端/curl 鉴权用）
+cat deploy/global-images/.admin-key
+```
+
+### 2.7 单独部署 Memory Core
+
+只需要记忆内核（不需要面板/代理）时：
 
 ```bash
 cd deploy/global-images
 bash start-memory-core.sh
+
+curl -s http://localhost:8420/health | jq .status   # 期望 "ok"
 ```
 
-启动后验证：
+### 2.8 常见报错速查
 
-```bash
-curl -s http://localhost:8420/health | jq .status
-# 期望输出: "ok"
-```
-
-### 2.5 部署后验证清单
-
-```bash
-# 1. 健康检查
-curl -s http://localhost:8420/health | jq '{status, stores, services}'
-
-# 2. 确认 Pipeline Worker 正常
-curl -s http://localhost:8420/health | jq .services.pipelineWorker
-
-# 3. 确认存储状态
-curl -s http://localhost:8420/health | jq .stores
-```
+| 报错 | 原因 | 解决 |
+|------|------|------|
+| `.env 不存在。先 cp .env.example .env` | 没执行 cp | `cp .env.example .env` |
+| `.env 中以下必填参数未设置或仍为 REPLACE_ME` | 有必填项没替换 | 按提示逐项填真值，注意 `MEMORY_LLM_*` 和 `PROXY_UPSTREAM_*` 两组都要填 |
+| `等待 ... 超时 / 健康检查失败` | 容器起不来，多为 LLM Key 无效或地址不可达 | `docker logs tdai-memory-core`（或对应容器）看具体报错 |
+| `admin user_key 校验失败` | `.admin-key` 与 volume 数据不匹配（如 volume 被清了但文件还在） | `./stop-all.sh --purge` 清数据后重新 `./start-all.sh` |
+| memory-hub 正常但 knowledge 调 memory 失败 | memory-core 未先启动 | 用 `./start-all.sh` 按序启动 |
 
 ---
 

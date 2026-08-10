@@ -1,0 +1,70 @@
+# 由 start-proxy.sh 自动生成 —— 每次启动覆盖，请不要手动改。
+server:
+  host: 0.0.0.0
+  port: 8096
+  forwardTimeoutMs: 600000
+
+upstream:
+  url: "https://api.deepseek.com/v1"
+  apiKey: "<REDACTED>"
+
+log:
+  file: ""
+  level: info
+  backend: console
+
+# tdai 内核对接（用于 injection / skill / auth 拉取）
+tdai:
+  enabled: true
+  endpoint: "http://memory-core:8420"
+  apiKey: "local"
+  serviceId: default
+  memory:
+    enabled: true
+    inject: true
+    writeL0: true
+    recallL1: true
+    injectL2L3: true
+
+  anonymous:
+    enabled: true
+    teamId: team-kawmpnjy7u
+    agentId: agt-qektbwzsta
+    userId: usr-j5z4b835p6
+
+
+skill:
+  endpoint: "http://memory-core:8420"
+  serviceToken: "local"
+
+auth:
+  enabled: true
+  url: "http://memory-core:8420"
+  timeoutMs: 5000
+
+sessionInit:
+  enabled: true
+  maxRetries: 3
+  injectAgentContext: true
+  injectTaskContext: true
+  headerAutoSelect:
+    enabled: true
+    teamHeader: "x-team-id"
+    agentHeader: "x-agent-id"
+    taskHeader: "x-task-id"
+    onMismatch: "form"
+
+costGuard:
+  enabled: false
+
+# 打开 skill + knowledge + tdai-memory 三个注入器；
+# knowledge 依赖 memory-hub 起来，否则 hook 内部会降级为空块。
+injection:
+  enabled: true
+  injectors:
+    - skill
+    - knowledge
+    - tdai-memory
+
+redis:
+  enabled: false
